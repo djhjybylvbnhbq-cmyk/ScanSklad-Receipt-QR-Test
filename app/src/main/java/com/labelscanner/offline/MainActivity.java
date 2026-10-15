@@ -58,6 +58,7 @@ import com.labelscanner.offline.databinding.ActivityMainBinding;
 
 import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -76,14 +77,21 @@ public class MainActivity extends AppCompatActivity {
 
     private ActivityMainBinding binding;
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
+    // The Russian OCR is deliberately kept off CameraX's frame analyzer thread.
+    // It consumes a private cropped Bitmap, NOT the ImageProxy owned by ML Kit.
+    private final ExecutorService receiptOcrExecutor = Executors.newSingleThreadExecutor();
     private final TextRecognizer recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
     private final BarcodeScanner barcodeScanner = BarcodeScanning.getClient(
             new BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build());
     // An offline Russian OCR fallback only for damaged/old receipt "Приход №" labels.
-    private TesseractReceiptRecognizer receiptRecognizer;
-    private boolean receiptOcrUnavailable = false;
+    private TesseractReceiptRecognizer receiptRecognizer; // owned by receiptOcrExecutor
+    private volatile boolean receiptOcrUnavailable = false;
+    private final AtomicBoolean receiptOcrBusy = new AtomicBoolean(false);
     private final AtomicLong lastTesseractAttemptMs = new AtomicLong(0);
-    private static final long TESSERACT_INTERVAL_MS = 650L;
+    private final AtomicLong scanGeneration = new AtomicLong(0);
+    private static final long TESSERACT_INTERVAL_MS = 850L;
+    private static final long FAST_SCAN_GRACE_MS = 380L;
+    private volatile long scanStartedAtMs = 0L;
     private ProcessCameraProvider cameraProvider;
     private AppStorage storage;
 
@@ -95,6 +103,7 @@ public class MainActivity extends AppCompatActivity {
     private final List<String> results = new ArrayList<>();
 
     private volatile boolean analysisBusy = false;
+    private volatile boolean appDestroyed = false;
     private String lastCandidate = null;
     private int candidateHits = 0;
     private long lastCandidateSeenAtMs = 0L;
@@ -501,7 +510,19 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startCamera() {
+        scanGeneration.incrementAndGet();
+        scanStartedAtMs = SystemClock.elapsedRealtime();
+        lastTesseractAttemptMs.set(0L);
         resetCandidateDebounce();
+        // Prepare Russian models while ML Kit reads the first frames. On the
+        // first old-style receipt we don't want to wait for model initialization.
+        if (screen == Screen.SCAN_ARRIVAL && !receiptOcrUnavailable) {
+            receiptOcrExecutor.execute(() -> {
+                if (receiptRecognizer != null || receiptOcrUnavailable) return;
+                try { receiptRecognizer = new TesseractReceiptRecognizer(this); }
+                catch (Exception | LinkageError ex) { receiptOcrUnavailable = true; }
+            });
+        }
         ListenableFuture<ProcessCameraProvider> future = ProcessCameraProvider.getInstance(this);
         future.addListener(() -> {
             try {
@@ -618,25 +639,63 @@ public class MainActivity extends AppCompatActivity {
                 } finally { closeFrame(imageProxy); }
             });
         } else {
+            final long epoch = scanGeneration.get();
             recognizer.process(image).addOnCompleteListener(task -> {
                 String found = null;
-                if (task.isSuccessful() && screen == Screen.SCAN_ARRIVAL) {
-                    found = findArrivalByPosition(task.getResult(), scanRoi);
+                if (task.isSuccessful() && screen == Screen.SCAN_ARRIVAL
+                        && scanGeneration.get() == epoch) {
+                    // Same inexpensive parser as production v2.0 is the FIRST path.
+                    // Old table labels also work when the label and number occupy
+                    // separate ML Kit bounding boxes (geometry fallback).
+                    found = LabelTextParser.findArrival(task.getResult(), scanRoi);
+                    if (found == null) found = findArrivalByPosition(task.getResult(), scanRoi);
                 }
                 if (found != null) {
                     acceptCandidate(found, Screen.SCAN_ARRIVAL);
                     closeFrame(imageProxy);
-                } else if (screen == Screen.SCAN_ARRIVAL && !receiptOcrUnavailable
-                        && SystemClock.elapsedRealtime() - lastTesseractAttemptMs.get() >= TESSERACT_INTERVAL_MS) {
-                    lastTesseractAttemptMs.set(SystemClock.elapsedRealtime());
-                    // Tesseract works on the analyzer executor and does not block the UI thread.
-                    cameraExecutor.execute(() -> {
+                    return;
+                }
+                // A failure in one ML Kit frame must not stop new frames while
+                // slower Russian OCR runs. Limit to one independent OCR job.
+                long now = SystemClock.elapsedRealtime();
+                if (appDestroyed || screen != Screen.SCAN_ARRIVAL || scanGeneration.get() != epoch
+                        || receiptOcrUnavailable || now - scanStartedAtMs < FAST_SCAN_GRACE_MS
+                        || now - lastTesseractAttemptMs.get() < TESSERACT_INTERVAL_MS
+                        || !receiptOcrBusy.compareAndSet(false, true)) {
+                    closeFrame(imageProxy);
+                    return;
+                }
+                lastTesseractAttemptMs.set(now);
+                // Camera analyzer owns the image while it is being copied.
+                // It is ALWAYS released before Tesseract starts processing.
+                cameraExecutor.execute(() -> {
+                    Bitmap cropped = null;
+                    try {
+                        if (scanGeneration.get() == epoch && screen == Screen.SCAN_ARRIVAL) {
+                            cropped = cropReceiptBitmap(imageProxy, scanRoi);
+                        }
+                    } finally {
+                        closeFrame(imageProxy);
+                    }
+                    if (cropped == null) {
+                        receiptOcrBusy.set(false);
+                        return;
+                    }
+                    final Bitmap toRecognize = cropped;
+                    receiptOcrExecutor.execute(() -> {
                         try {
-                            String fallback = tryRussianOcr(imageProxy, scanRoi);
-                            if (fallback != null) runOnUiThread(() -> acceptCandidate(fallback, Screen.SCAN_ARRIVAL));
-                        } finally { closeFrame(imageProxy); }
+                            if (scanGeneration.get() != epoch || screen != Screen.SCAN_ARRIVAL) return;
+                            String fallback = tryRussianOcr(toRecognize);
+                            if (fallback != null) runOnUiThread(() -> {
+                                if (scanGeneration.get() == epoch && screen == Screen.SCAN_ARRIVAL)
+                                    acceptCandidate(fallback, Screen.SCAN_ARRIVAL);
+                            });
+                        } finally {
+                            toRecognize.recycle();
+                            receiptOcrBusy.set(false);
+                        }
                     });
-                } else closeFrame(imageProxy);
+                });
             });
         }
     }
@@ -677,13 +736,12 @@ public class MainActivity extends AppCompatActivity {
         return null;
     }
 
-    private String tryRussianOcr(ImageProxy proxy, RectF roi) {
-        Bitmap raw = null, upright = null, cropped = null;
+    /** Create an independent image for Russian OCR; called from the camera analyzer.
+     * The red-frame crop is preserved exactly as in the original QR TEST.
+     */
+    private static Bitmap cropReceiptBitmap(ImageProxy proxy, RectF roi) {
+        Bitmap raw = null, upright = null;
         try {
-            if (receiptRecognizer == null) {
-                try { receiptRecognizer = new TesseractReceiptRecognizer(this); }
-                catch (Exception | LinkageError modelFailure) { receiptOcrUnavailable = true; return null; }
-            }
             raw = proxy.toBitmap();
             int rotation = proxy.getImageInfo().getRotationDegrees();
             if (rotation != 0) {
@@ -691,23 +749,39 @@ public class MainActivity extends AppCompatActivity {
                 matrix.postRotate(rotation);
                 upright = Bitmap.createBitmap(raw, 0, 0, raw.getWidth(), raw.getHeight(), matrix, true);
             } else upright = raw;
-            // ML Kit bounding boxes and mapped scan ROI are defined in the upright coordinate system.
-            int l = Math.max(0, (int)Math.floor(roi.left));
-            int t = Math.max(0, (int)Math.floor(roi.top));
-            int r = Math.min(upright.getWidth(), (int)Math.ceil(roi.right));
-            int b = Math.min(upright.getHeight(), (int)Math.ceil(roi.bottom));
+            int l = Math.max(0, (int) Math.floor(roi.left));
+            int t = Math.max(0, (int) Math.floor(roi.top));
+            int r = Math.min(upright.getWidth(), (int) Math.ceil(roi.right));
+            int b = Math.min(upright.getHeight(), (int) Math.ceil(roi.bottom));
             if (r - l < 70 || b - t < 35) return null;
-            cropped = Bitmap.createBitmap(upright, l, t, r - l, b - t);
+            // Use an independent buffer; a whole-frame crop may otherwise return
+            // the source bitmap, which is recycled when the camera frame closes.
+            Bitmap view = Bitmap.createBitmap(upright, l, t, r - l, b - t);
+            Bitmap copy = view.copy(Bitmap.Config.ARGB_8888, false);
+            if (view != upright && view != raw) view.recycle();
+            return copy;
+        } catch (RuntimeException | LinkageError ex) {
+            return null;
+        } finally {
+            if (upright != null && upright != raw) upright.recycle();
+            if (raw != null) raw.recycle();
+        }
+    }
+
+    /** Runs on the dedicated receiptOcrExecutor, without holding any camera frame. */
+    private String tryRussianOcr(Bitmap cropped) {
+        try {
+            if (receiptRecognizer == null) {
+                try { receiptRecognizer = new TesseractReceiptRecognizer(this); }
+                catch (Exception | LinkageError ex) { receiptOcrUnavailable = true; return null; }
+            }
             String first = receiptRecognizer.recognizeWebStyle(cropped).text;
             String number = ArrivalGeometry.fromRussianOcr(first);
             if (number != null) return number;
+            // Keep the secondary layout mode for old labels with table columns.
             return ArrivalGeometry.fromRussianOcr(receiptRecognizer.recognizeLine(cropped).text);
-        } catch (Exception | LinkageError failure) {
-            return null; // Temporary image/rotation issue: try again on the next frame.
-        } finally {
-            if (cropped != null && cropped != upright) cropped.recycle();
-            if (upright != null && upright != raw) upright.recycle();
-            if (raw != null) raw.recycle();
+        } catch (Exception | LinkageError ex) {
+            return null;
         }
     }
 
@@ -738,6 +812,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void stopCamera() {
+        scanGeneration.incrementAndGet(); // discard pending OCR results from old screen
         if (cameraProvider != null) {
             cameraProvider.unbindAll();
         }
@@ -773,15 +848,17 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        appDestroyed = true;
+        scanGeneration.incrementAndGet();
         persistProgress();
         stopCamera();
         recognizer.close();
         barcodeScanner.close();
-        // Camera executor owns Tesseract instance. Release it on that same thread.
-        if (receiptRecognizer != null) {
-            TesseractReceiptRecognizer toClose = receiptRecognizer;
-            cameraExecutor.execute(toClose::close);
-        }
+        // Release native Tesseract on the same dedicated executor that created it.
+        receiptOcrExecutor.execute(() -> {
+            if (receiptRecognizer != null) receiptRecognizer.close();
+        });
+        receiptOcrExecutor.shutdown();
         cameraExecutor.shutdown();
         super.onDestroy();
     }
