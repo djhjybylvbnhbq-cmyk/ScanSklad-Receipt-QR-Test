@@ -12,6 +12,9 @@ import android.graphics.RectF;
 import android.graphics.Rect;
 import android.graphics.Bitmap;
 import android.graphics.Matrix;
+import android.os.Build;
+import android.util.Size;
+import android.view.MotionEvent;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.text.InputType;
@@ -27,7 +30,10 @@ import androidx.annotation.NonNull;
 import androidx.annotation.OptIn;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.core.Camera;
 import androidx.camera.core.CameraSelector;
+import androidx.camera.core.FocusMeteringAction;
+import androidx.camera.core.MeteringPoint;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
@@ -62,6 +68,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 @OptIn(markerClass = TransformExperimental.class)
 public class MainActivity extends AppCompatActivity {
@@ -89,13 +96,28 @@ public class MainActivity extends AppCompatActivity {
     private final AtomicBoolean receiptOcrBusy = new AtomicBoolean(false);
     private final AtomicLong lastTesseractAttemptMs = new AtomicLong(0);
     private final AtomicLong scanGeneration = new AtomicLong(0);
-    private static final long TESSERACT_INTERVAL_MS = 850L;
-    private static final long FAST_SCAN_GRACE_MS = 380L;
+    private static final long TESSERACT_INTERVAL_MS = 950L;
+    private static final long FAST_SCAN_GRACE_MS = 450L;
     private volatile long scanStartedAtMs = 0L;
+    private final AtomicLong frameSequence = new AtomicLong();
     private ProcessCameraProvider cameraProvider;
+    private Camera boundCamera;
+    private boolean highResolution = false;
+    private boolean resolutionUpgradeAttempted = false;
+    private long lastFocusStartedAtMs;
+    private int focusRequests;
+    private long focusDurationMs = -1L;
+    private String focusResult = "не проверен";
+    private int analysisWidth = 0, analysisHeight = 0;
+    private int mlKitRuns = 0, tessRuns = 0;
+    private long mlKitLastMs = -1, tessLastMs = -1;
+    private int lastTextHeight = -1;
+    private long lastAcceptMs = -1;
+    private String lastEngine = "—", lastAccepted = "—";
+    private String previousScanSummary = "Сканирование ещё не завершалось";
     private AppStorage storage;
 
-    private Screen screen = Screen.SCAN_ARRIVAL;
+    private volatile Screen screen = Screen.SCAN_ARRIVAL;
     private String arrival = "";
     private String code = "";
     private String boxes = "";
@@ -104,10 +126,8 @@ public class MainActivity extends AppCompatActivity {
 
     private volatile boolean analysisBusy = false;
     private volatile boolean appDestroyed = false;
-    private String lastCandidate = null;
-    private int candidateHits = 0;
-    private long lastCandidateSeenAtMs = 0L;
-    private static final long CANDIDATE_CONFIRM_WINDOW_MS = 1800L;
+    // Never confirm twice from the same camera frame, even if engines finish out of order.
+    private final ScanConsensus consensus = new ScanConsensus();
 
     // CameraX coordinate mapping. The OCR result is in ImageAnalysis coordinates,
     // while the red frame is drawn in PreviewView coordinates. Version 1.3 maps
@@ -138,6 +158,19 @@ public class MainActivity extends AppCompatActivity {
         imageProxyTransformFactory.setUsingRotationDegrees(true);
         binding.previewView.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, orr, ob) -> refreshPreviewMapping());
         binding.scanFrame.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, orr, ob) -> refreshPreviewMapping());
+        // Long press the green header for current/previous scan diagnostics.
+        binding.titleText.setOnLongClickListener(v -> { showDiagnostics(); return true; });
+        binding.scanFrame.setOnClickListener(v -> requestFocusAt(
+                binding.scanFrame.getLeft() + binding.scanFrame.getWidth() / 2f - binding.previewView.getLeft(),
+                binding.scanFrame.getTop() + binding.scanFrame.getHeight() / 2f - binding.previewView.getTop()));
+        binding.previewView.setOnTouchListener((v, event) -> {
+            if (event.getAction() == MotionEvent.ACTION_UP) {
+                requestFocusAt(event.getX(), event.getY());
+                v.performClick();
+                return true;
+            }
+            return event.getAction() == MotionEvent.ACTION_DOWN;
+        });
 
         storage = new AppStorage(this);
         results.addAll(storage.loadResults());
@@ -510,10 +543,19 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startCamera() {
-        scanGeneration.incrementAndGet();
+        long startEpoch = scanGeneration.incrementAndGet();
         scanStartedAtMs = SystemClock.elapsedRealtime();
         lastTesseractAttemptMs.set(0L);
         resetCandidateDebounce();
+        highResolution = false;
+        resolutionUpgradeAttempted = false;
+        frameSequence.set(0L);
+        mlKitRuns = 0; tessRuns = 0;
+        mlKitLastMs = -1; tessLastMs = -1;
+        lastTextHeight = -1;
+        lastAcceptMs = -1;
+        lastAccepted = "—"; lastEngine = "—";
+        focusRequests = 0; focusDurationMs = -1; focusResult = "не проверен";
         // Prepare Russian models while ML Kit reads the first frames. On the
         // first old-style receipt we don't want to wait for model initialization.
         if (screen == Screen.SCAN_ARRIVAL && !receiptOcrUnavailable) {
@@ -526,6 +568,8 @@ public class MainActivity extends AppCompatActivity {
         ListenableFuture<ProcessCameraProvider> future = ProcessCameraProvider.getInstance(this);
         future.addListener(() -> {
             try {
+                if (appDestroyed || scanGeneration.get() != startEpoch
+                        || !(screen == Screen.SCAN_ARRIVAL || screen == Screen.SCAN_CODE)) return;
                 cameraProvider = future.get();
                 bindCameraUseCases();
             } catch (Exception e) {
@@ -548,8 +592,11 @@ public class MainActivity extends AppCompatActivity {
                 .build();
         preview.setSurfaceProvider(binding.previewView.getSurfaceProvider());
 
+        // Moderate default analysis resolution is usually faster on Snapdragon 680.
+        // We request a higher resolution only when small text stays unreadable.
         ImageAnalysis analysis = new ImageAnalysis.Builder()
                 .setTargetRotation(targetRotation)
+                .setTargetResolution(highResolution ? new Size(1920, 1080) : new Size(1280, 720))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build();
         analysis.setAnalyzer(cameraExecutor, this::analyzeFrame);
@@ -564,12 +611,21 @@ public class MainActivity extends AppCompatActivity {
             if (viewPort != null) {
                 group.setViewPort(viewPort);
             }
-            cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, group.build());
-
+            boundCamera = cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, group.build());
+            binding.previewView.postDelayed(() -> {
+                if (screen == Screen.SCAN_ARRIVAL || screen == Screen.SCAN_CODE) requestFocusCenter();
+            }, 380);
             binding.previewView.postDelayed(this::refreshPreviewMapping, 120);
             binding.previewView.postDelayed(this::refreshPreviewMapping, 450);
         } catch (Exception e) {
-            Toast.makeText(this, "Ошибка запуска камеры", Toast.LENGTH_LONG).show();
+            if (highResolution) {
+                // Some camera HALs do not support the higher resolution with Preview.
+                // Automatically recover the working default instead of losing the camera.
+                highResolution = false;
+                bindCameraUseCases();
+            } else {
+                Toast.makeText(this, "Ошибка запуска камеры", Toast.LENGTH_LONG).show();
+            }
         }
     }
 
@@ -627,6 +683,10 @@ public class MainActivity extends AppCompatActivity {
         if (scanRoi == null || scanRoi.isEmpty()) { imageProxy.close(); return; }
 
         final Screen scanScreen = screen;
+        final long frameId = frameSequence.incrementAndGet();
+        analysisWidth = imageProxy.getWidth();
+        analysisHeight = imageProxy.getHeight();
+        final long mlStartedAt = SystemClock.elapsedRealtime();
         analysisBusy = true;
         InputImage image = InputImage.fromMediaImage(mediaImage, imageProxy.getImageInfo().getRotationDegrees());
         if (scanScreen == Screen.SCAN_CODE) {
@@ -634,30 +694,36 @@ public class MainActivity extends AppCompatActivity {
                 try {
                     if (task.isSuccessful() && screen == Screen.SCAN_CODE) {
                         String found = findQrAddress(task.getResult(), scanRoi);
-                        if (found != null) acceptCandidate(found, Screen.SCAN_CODE);
+                        if (found != null) acceptCandidate(found, Screen.SCAN_CODE, "QR", frameId);
                     }
                 } finally { closeFrame(imageProxy); }
             });
         } else {
             final long epoch = scanGeneration.get();
             recognizer.process(image).addOnCompleteListener(task -> {
+                mlKitLastMs = SystemClock.elapsedRealtime() - mlStartedAt;
+                mlKitRuns++;
                 String found = null;
                 if (task.isSuccessful() && screen == Screen.SCAN_ARRIVAL
                         && scanGeneration.get() == epoch) {
                     // Same inexpensive parser as production v2.0 is the FIRST path.
                     // Old table labels also work when the label and number occupy
                     // separate ML Kit bounding boxes (geometry fallback).
+                    lastTextHeight = maxTextHeightInRoi(task.getResult(), scanRoi);
                     found = LabelTextParser.findArrival(task.getResult(), scanRoi);
                     if (found == null) found = findArrivalByPosition(task.getResult(), scanRoi);
                 }
                 if (found != null) {
-                    acceptCandidate(found, Screen.SCAN_ARRIVAL);
+                    acceptCandidate(found, Screen.SCAN_ARRIVAL, "ML Kit", frameId);
                     closeFrame(imageProxy);
                     return;
                 }
                 // A failure in one ML Kit frame must not stop new frames while
                 // slower Russian OCR runs. Limit to one independent OCR job.
                 long now = SystemClock.elapsedRealtime();
+                // Only increase resolution if text in the target frame is demonstrably
+                // too small; blindly using 1080p slows down older phones.
+                maybeUpgradeResolution(now, epoch);
                 if (appDestroyed || screen != Screen.SCAN_ARRIVAL || scanGeneration.get() != epoch
                         || receiptOcrUnavailable || now - scanStartedAtMs < FAST_SCAN_GRACE_MS
                         || now - lastTesseractAttemptMs.get() < TESSERACT_INTERVAL_MS
@@ -685,10 +751,14 @@ public class MainActivity extends AppCompatActivity {
                     receiptOcrExecutor.execute(() -> {
                         try {
                             if (scanGeneration.get() != epoch || screen != Screen.SCAN_ARRIVAL) return;
+                            long startOcr = SystemClock.elapsedRealtime();
                             String fallback = tryRussianOcr(toRecognize);
-                            if (fallback != null) runOnUiThread(() -> {
-                                if (scanGeneration.get() == epoch && screen == Screen.SCAN_ARRIVAL)
-                                    acceptCandidate(fallback, Screen.SCAN_ARRIVAL);
+                            long elapsedOcr = SystemClock.elapsedRealtime() - startOcr;
+                            runOnUiThread(() -> {
+                                if (scanGeneration.get() != epoch || screen != Screen.SCAN_ARRIVAL) return;
+                                tessRuns++;
+                                tessLastMs = elapsedOcr;
+                                if (fallback != null) acceptCandidate(fallback, Screen.SCAN_ARRIVAL, "Tesseract", frameId);
                             });
                         } finally {
                             toRecognize.recycle();
@@ -778,26 +848,27 @@ public class MainActivity extends AppCompatActivity {
             String first = receiptRecognizer.recognizeWebStyle(cropped).text;
             String number = ArrivalGeometry.fromRussianOcr(first);
             if (number != null) return number;
-            // Keep the secondary layout mode for old labels with table columns.
+            // Second pass only when the first image has signs of a receipt or
+            // was blank. Otherwise two costly passes on irrelevant frames slow
+            // down Huawei-class devices and can increase false positives.
+            if (!mayBenefitFromSecondPass(first)) return null;
             return ArrivalGeometry.fromRussianOcr(receiptRecognizer.recognizeLine(cropped).text);
         } catch (Exception | LinkageError ex) {
             return null;
         }
     }
 
-    private void acceptCandidate(String candidate, Screen scanScreen) {
+    /** UI-thread only. Require identical results from two different camera frames. */
+    private void acceptCandidate(String candidate, Screen scanScreen, String engine, long frameId) {
         if (screen != scanScreen || candidate == null || candidate.isEmpty()) return;
         long now = SystemClock.elapsedRealtime();
-        if (candidate.equals(lastCandidate) && now - lastCandidateSeenAtMs <= CANDIDATE_CONFIRM_WINDOW_MS) {
-            candidateHits++;
-        } else { lastCandidate = candidate; candidateHits = 1; }
-        lastCandidateSeenAtMs = now;
-        if (candidateHits < 2) return;
-        runOnUiThread(() -> {
-            if (screen != scanScreen) return;
-            if (scanScreen == Screen.SCAN_ARRIVAL) { arrival = candidate; switchTo(Screen.CONFIRM_ARRIVAL); }
-            else { code = candidate; switchTo(Screen.CONFIRM_CODE); }
-        });
+        if (!consensus.offer(candidate, engine, frameId, now)) return;
+        lastAccepted = candidate;
+        lastEngine = engine;
+        lastAcceptMs = now - scanStartedAtMs;
+        previousScanSummary = diagnosticReport();
+        if (scanScreen == Screen.SCAN_ARRIVAL) { arrival = candidate; switchTo(Screen.CONFIRM_ARRIVAL); }
+        else { code = candidate; switchTo(Screen.CONFIRM_CODE); }
     }
 
     private void closeFrame(ImageProxy proxy) {
@@ -805,19 +876,123 @@ public class MainActivity extends AppCompatActivity {
         proxy.close();
     }
 
-    private void resetCandidateDebounce() {
-        lastCandidate = null;
-        candidateHits = 0;
-        lastCandidateSeenAtMs = 0L;
-    }
+    private void resetCandidateDebounce() { consensus.reset(); }
 
     private void stopCamera() {
         scanGeneration.incrementAndGet(); // discard pending OCR results from old screen
         if (cameraProvider != null) {
             cameraProvider.unbindAll();
         }
+        boundCamera = null;
         analysisBusy = false;
         resetCandidateDebounce();
+    }
+
+    private static boolean mayBenefitFromSecondPass(String raw) {
+        if (raw == null || raw.trim().isEmpty()) return true;
+        String s = raw.toUpperCase(java.util.Locale.ROOT);
+        // Short, damaged OCR fragments can still succeed in the second mode,
+        // particularly on old table-based receipts.
+        if (s.length() <= 20) return true;
+        return s.contains("ПРИ") || s.contains("ПРХ") || s.contains("№")
+                || s.contains("PRIH") || s.contains("NPUX") || s.contains("PRIX")
+                || s.matches(".*\\d{4,9}.*");
+    }
+
+    private int maxTextHeightInRoi(Text text, RectF frame) {
+        int height = -1;
+        for (Text.TextBlock block : text.getTextBlocks()) {
+            for (Text.Line line : block.getLines()) {
+                Rect box = line.getBoundingBox();
+                if (box != null && withinRedFrame(box, frame)) {
+                    height = Math.max(height, box.height());
+                }
+            }
+        }
+        return height;
+    }
+
+    private void maybeUpgradeResolution(long now, long epoch) {
+        if (resolutionUpgradeAttempted || highResolution || screen != Screen.SCAN_ARRIVAL
+                || now - scanStartedAtMs < 3000 || lastTextHeight < 0 || lastTextHeight >= 16
+                || Math.max(analysisWidth, analysisHeight) >= 1600 || consensus.hits() > 0) return;
+        resolutionUpgradeAttempted = true;
+        // Rebinding on UI thread avoids binding a camera lifecycle from worker callbacks.
+        runOnUiThread(() -> {
+            if (appDestroyed || screen != Screen.SCAN_ARRIVAL || scanGeneration.get() != epoch) return;
+            highResolution = true;
+            scanGeneration.incrementAndGet();
+            resetCandidateDebounce();
+            previewOutputTransform = null;
+            scanFrameRectInPreview = null;
+            bindCameraUseCases();
+        });
+    }
+
+    private void requestFocusCenter() {
+        if (binding == null || !(screen == Screen.SCAN_ARRIVAL || screen == Screen.SCAN_CODE)) return;
+        float cx = binding.scanFrame.getLeft() + binding.scanFrame.getWidth() / 2f - binding.previewView.getLeft();
+        float cy = binding.scanFrame.getTop() + binding.scanFrame.getHeight() / 2f - binding.previewView.getTop();
+        requestFocusAt(cx, cy);
+    }
+
+    private void requestFocusAt(float x, float y) {
+        if (boundCamera == null || binding == null ||
+                !(screen == Screen.SCAN_ARRIVAL || screen == Screen.SCAN_CODE)) return;
+        try {
+            // Keep focus points inside the target area even if the user taps outside it.
+            RectF frame = scanFrameRectInPreview;
+            if (frame != null && !frame.isEmpty()) {
+                x = Math.max(frame.left + 5f, Math.min(frame.right - 5f, x));
+                y = Math.max(frame.top + 5f, Math.min(frame.bottom - 5f, y));
+            }
+            MeteringPoint point = binding.previewView.getMeteringPointFactory().createPoint(x, y);
+            FocusMeteringAction action = new FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+                    .setAutoCancelDuration(4, TimeUnit.SECONDS)
+                    .build();
+            focusRequests++;
+            focusResult = "в процессе";
+            lastFocusStartedAtMs = SystemClock.elapsedRealtime();
+            ListenableFuture<androidx.camera.core.FocusMeteringResult> future =
+                    boundCamera.getCameraControl().startFocusAndMetering(action);
+            future.addListener(() -> {
+                if (isFinishing() || appDestroyed) return;
+                focusDurationMs = SystemClock.elapsedRealtime() - lastFocusStartedAtMs;
+                try { focusResult = future.get().isFocusSuccessful() ? "наведён" : "без подтверждения"; }
+                catch (Exception ex) { focusResult = "недоступен"; }
+            }, ContextCompat.getMainExecutor(this));
+        } catch (RuntimeException ex) { focusResult = "камера не поддерживает"; }
+    }
+
+    private String diagnosticReport() {
+        return "Устройство: " + Build.MANUFACTURER + " " + Build.MODEL
+                + "\nAndroid: " + Build.VERSION.RELEASE
+                + "\nАнализ: " + analysisWidth + "×" + analysisHeight
+                + (highResolution ? " (повышенное)" : " (основное)")
+                + "\nФокус: " + focusResult + ", " + focusDurationMs + " мс; попыток: " + focusRequests
+                + "\nML Kit: " + mlKitRuns + " кадров, последний " + mlKitLastMs + " мс"
+                + "\nTesseract: " + tessRuns + " запусков, последний " + tessLastMs + " мс"
+                + "\nВысота текста: " + lastTextHeight + " px"
+                + "\nПодтверждений: " + consensus.hits() + ", сбросов: " + consensus.resets()
+                + "\nПоследний номер: " + lastAccepted
+                + "\nДвижок: " + lastEngine
+                + "\nДо результата: " + lastAcceptMs + " мс";
+    }
+
+    private void showDiagnostics() {
+        String report = diagnosticReport();
+        if (screen != Screen.SCAN_ARRIVAL && screen != Screen.SCAN_CODE) {
+            report = previousScanSummary;
+        }
+        final String copy = report;
+        new AlertDialog.Builder(this).setTitle("Диагностика ScanSklad FAST v0.3")
+                .setMessage(report)
+                .setNegativeButton("ЗАКРЫТЬ", null)
+                .setPositiveButton("КОПИРОВАТЬ", (d, w) -> {
+                    ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                    clipboard.setPrimaryClip(ClipData.newPlainText("ScanSklad диагностика", copy));
+                    Toast.makeText(this, "Диагностика скопирована", Toast.LENGTH_SHORT).show();
+                }).show();
     }
 
     private void showKeyboard() {
